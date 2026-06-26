@@ -2233,6 +2233,16 @@ async function tryHandleOocDuringCheckout(from, userText, draft, state) {
       if (/^(boleh|tolong)\s+info\s+(nama|alamat)/i.test(lower)) return false;
       if (reply.length < 5) return false;
       await sendWhatsAppMessage(from, reply);
+      // Auto-notify admin if LLM replied with admin handoff
+      if (/(?:teruskan|sambungkan|hubungkan|forward|eskalasi|admin\s+kami|kami\s+admin)\s*(?:ke|sama|dengan)?\s*admin|admin\s*(?:akan|bakal|nanti|segera|lagi)\s*(?:bantu|cek|tinjau|review|proses|tindaklanjut)/i.test(reply)) {
+        const _ahName = (loadSbsrDraft(from) || {}).customer_name || "?";
+        const _ahState = (loadSbsrDraft(from) || {}).state || "?";
+        await notifySbsrAdminsText(
+          ["🚨 *LLM ADMIN HANDOFF*", "Customer: " + _ahName + " (+" + from + ")", "State: " + _ahState, "LLM reply: \"" + reply.slice(0, 200) + "\""].join("\n"),
+          "sbsr-llm-admin-handoff"
+        );
+        log("sbsr-ooc", "admin_handoff_detected_in_llm_reply");
+      }
       // Auto-send interactive buttons if LLM asks "mau lanjut?"
       if (/mau\s+langsung\s+pesan|lanjut\s+ke\s+alamat|mau\s+lanjut\s+pesan/i.test(reply)) {
         try {
@@ -4213,7 +4223,6 @@ async function tryHandleAddressPinConfirm(from, userText) {
       const name = draft.customer_name || "Pelanggan";
       await sendWhatsAppMessage(from, "Baik Kak, Mintu bantu teruskan ke admin ya 🤍");
       await notifySbsrAdminsText(
-        from,
         [
           "⚠️ *ADDRESS/PIN SEMANTIC MISMATCH*",
           `Nama: ${name}`,
@@ -4222,7 +4231,7 @@ async function tryHandleAddressPinConfirm(from, userText) {
           `Decoded place: ${conf.decoded_place || "-"}`,
           `Maps link: ${conf.gmaps_link || "-"}`,
         ].join("\n"),
-        "out_of_context"
+        "sbsr-addr-mismatch-handoff"
       );
       saveSbsrDraft(from, {
         ...draft,
@@ -4291,14 +4300,13 @@ async function tryHandleAddressPinConfirm(from, userText) {
     const name = draft.customer_name || "Pelanggan";
     await sendWhatsAppMessage(from, "Baik Kak, Mintu bantu teruskan ke admin ya 🤍");
     await notifySbsrAdminsText(
-      from,
       [
         "⚠️ *ADDRESS/PIN CONFIRM - ADMIN HANDOFF*",
         `Nama: ${name}`,
         `Phone: ${from}`,
         `Alamat tertulis: ${conf.address_text || draft.address_text || "-"}`,
       ].join("\n"),
-      "out_of_context"
+      "sbsr-addr-confirm-handoff"
     );
     return true;
   }
@@ -7185,6 +7193,8 @@ function resetSbsrCheckoutState(from) {
   const draft = loadSbsrDraft(from) || { phone: from };
   const state = String(draft.state || "").trim().toLowerCase();
   if (!SBSR_TRANSIENT_RESET_STATES.has(state)) return false;
+  // Safety: jangan nuke cart aktif. User cuma greeting ("hi"/"halo"). Reset eksplisit dihandle SBSR_MANUAL_RESET_RE.
+  if (Array.isArray(draft.items) && draft.items.length > 0) return false;
   const next = {
     ...draft,
     state: null,
@@ -7469,9 +7479,15 @@ async function tryHandlePickupFlow(from, userText) {
 }
 
 async function tryHandleDeterministicGreeting(from, userText) {
-  // DISABLED — LLM handles greeting naturally via OpenClaw.
-  // Greeting & all natural variants (halo, pagi, No 1 min, menu dong, etc.)
-  // are handled by the LLM downstream. Catalog requests are caught by CATALOG_REQUEST_RE.
+  // Only fire when draft is empty (no active cart/checkout).
+  // During active checkout, greetings pass through to LLM for natural handling.
+  const draft = loadSbsrDraft(from);
+  if (draft && draft.state) return false; // active checkout — let LLM handle
+  const t = String(userText || '').trim().toLowerCase();
+  if (/^(?:hi|halo|hello|helo|hai|pagi|siang|sore|malam|assalamu|permisi|tes|test)$/i.test(t)) {
+    await sendWhatsAppMessage(from, SBSR_FIXED_GREETING_TEXT);
+    return true;
+  }
   return false;
 }
 
@@ -7711,6 +7727,38 @@ async function tryHandleTextVariantSelection(from, userText) {
     return false;
   }
 }
+
+// === GLOBAL ADD-MORE: detect "tambah"/"nambah" in ANY checkout state ===
+// Fires before LLM so customer can add items without hallucination.
+const GLOBAL_ADD_MORE_RE = /\b(?:tambah|nambah|tambahin|add\s*more|tambah\s+lagi|mau\s+tambah|mau\s+nambah|bisa\s+tambah|tambah\s+dikit|tambah\s+sedikit|tambah\s+aja|tambah\s+dulu|tambah\s+pesanan)\b/i;
+const GLOBAL_ADD_ITEM_RE = /\b(?:tambah|nambah|tambahin)\s+(.+?)(?:\s+(\d+))?\s*$/i;
+
+async function tryHandleGlobalAddMore(from, userText) {
+  var t = String(userText || "").trim();
+  if (t.length < 4 || t.length > 200) return false;
+  if (!GLOBAL_ADD_MORE_RE.test(t)) return false;
+  var _md = loadSbsrDraft(from) || {};
+  if (!_md.items || !Array.isArray(_md.items) || _md.items.length === 0) return false;
+  log("sbsr-add-more", "global_detected from=" + from + " state=" + (_md.state || "none"));
+  _md.add_more_mode = true;
+  _md.state = "awaiting_product_selection";
+  saveSbsrDraft(from, _md);
+  var _itemMatch = t.match(GLOBAL_ADD_ITEM_RE);
+  if (_itemMatch) {
+    var _itemName = _itemMatch[1].trim();
+    await sendWhatsAppMessage(from,
+      "Siap Kak, Mintu bantu tambahin \"" + _itemName + "\" ya \u{1f90d}\n\n" +
+      "Silakan pilih varian dari katalog di bawah — nanti totalnya Mintu gabungkan ya."
+    );
+  } else {
+    await sendWhatsAppMessage(from, "Siap Kak, Mintu buka menu lagi ya. Pesanan sebelumnya tetap aman, nanti totalnya Mintu gabungkan \u{1f90d}");
+  }
+  await sendWhatsAppCatalog(from);
+  log("sbsr-add-more", "catalog_sent preserving_items=" + _md.items.length);
+  return true;
+}
+
+
 // === MISSING-FORM GUARD: tanya frozen/goreng sebelum parse free-text ===
 // Fires when customer mentions specific variants + asks price/total
 // but doesn't specify frozen/goreng/matang/mentah.
@@ -8348,6 +8396,15 @@ async function tryHandleOutOfContextHandoff(from, userText) {
           var _oocReply = String(_oocR).trim();
           if (_oocReply.length > 5 && !/^(boleh|tolong|mohon|silahkan|kirim)\s+(kirim|isi|infokan|masukkan|share)\s*(alamat|pin|lokasi|nama)/i.test(_oocReply)) {
             await sendWhatsAppMessage(from, _oocReply);
+            // Auto-notify admin if LLM replied with admin handoff in smart_ooc
+            if (/(?:teruskan|sambungkan|hubungkan|forward|eskalasi|admin\s+kami)\s*(?:ke|sama|dengan)?\s*admin|admin\s*(?:akan|bakal|nanti|segera|lagi)\s*(?:bantu|cek|tinjau|review|proses|tindaklanjut)/i.test(_oocReply)) {
+              const _ahDraft2 = loadSbsrDraft(from) || {};
+              await notifySbsrAdminsText(
+                ["🚨 *LLM ADMIN HANDOFF (smart_ooc)*", "Customer: " + (_ahDraft2.customer_name || "?") + " (+" + from + ")", "State: " + state, "LLM reply: \"" + _oocReply.slice(0, 200) + "\""].join("\n"),
+                "sbsr-llm-admin-handoff"
+              );
+              log("sbsr-ooc", "admin_handoff_detected_in_smart_ooc");
+            }
             log('sbsr-ooc', 'smart_ooc state=' + state + ' reply=' + _oocReply.slice(0, 100));
             _oocOk = true;
           }
@@ -9477,6 +9534,13 @@ async function handleMessage(msg, contacts) {
         const _isMapsUrl = /^https?:\/\/.*(?:google\.com\/maps|maps\.google|goo\.gl\/maps|maps\.app\.goo\.gl)/i.test(_trimText);
         // Skip interactive list replies (deterministic variant selection)
         const _isInteractiveReply = _trimText.length <= 3 && /^\d+$/.test(_trimText) && _routerState === "awaiting_product_selection";
+      // === ADD-MORE DETECTION: detect "tambah"/"nambah" in any checkout state ===
+      if (await tryHandleGlobalAddMore(from, _trimText)) {
+        sbsrRouterLogRail("llm-sopir-add-more");
+        sendReaction(from, messageId, "").catch(() => {});
+        return;
+      }
+      // === END ADD-MORE DETECTION ===
         if (!_structuredInput && !_isMapsUrl && !_isInteractiveReply && !_isDeterministicOnly) {
           // === MISSING-FORM CLARIFICATION: re-parse after form clarified ===
           if (await tryHandleMissingFormClarification(from, _trimText)) {
@@ -10069,6 +10133,15 @@ function getStateNudgeText(state) {
           var _oocReply2 = String(_oocR2).trim();
           if (_oocReply2.length > 5 && !/^(boleh|tolong|mohon|silahkan|kirim|share)\s+(kirim|isi|infokan|masukkan|share)\s*(alamat|pin|lokasi|nama)/i.test(_oocReply2)) {
             await sendWhatsAppMessage(from, _oocReply2);
+            // Auto-notify admin if LLM replied with admin handoff in smart_block_ooc
+            if (/(?:teruskan|sambungkan|hubungkan|forward|eskalasi|admin\s+kami)\s*(?:ke|sama|dengan)?\s*admin|admin\s*(?:akan|bakal|nanti|segera|lagi)\s*(?:bantu|cek|tinjau|review|proses|tindaklanjut)/i.test(_oocReply2)) {
+              const _ahDraft3 = loadSbsrDraft(from) || {};
+              await notifySbsrAdminsText(
+                ["🚨 *LLM ADMIN HANDOFF (smart_block)*", "Customer: " + (_ahDraft3.customer_name || "?") + " (+" + from + ")", "State: " + _postState, "LLM reply: \"" + _oocReply2.slice(0, 200) + "\""].join("\n"),
+                "sbsr-llm-admin-handoff"
+              );
+              log("sbsr-ooc", "admin_handoff_detected_in_smart_block_ooc");
+            }
             log('sbsr-ooc', 'smart_block_ooc state=' + _postState + ' reply=' + _oocReply2.slice(0, 100));
             // Auto-send interactive buttons if LLM asks "mau lanjut?"
             if (/mau\s+langsung\s+pesan|lanjut\s+ke\s+alamat|mau\s+lanjut\s+pesan/i.test(_oocReply2)) {
@@ -10565,6 +10638,39 @@ app.post("/biteship-webhook", async (req, res) => {
 });
 
 // --- Admin inbox panel (mount before listen) ---
+
+// --- Admin: send image via WhatsApp (base64 JSON) — with preview URL ---
+app.post("/admin-send-image", express.json({ limit: "15mb" }), async (req, res) => {
+  log("admin-send-image", "REQUEST received, headers: " + Object.keys(req.headers).join(","));
+  try {
+    const { phone, image_base64, mime_type, caption } = req.body;
+    if (!phone) return res.status(400).json({ error: "missing phone" });
+    if (!image_base64) return res.status(400).json({ error: "missing image_base64" });
+    const buf = Buffer.from(image_base64, "base64");
+    const mime = mime_type || "image/jpeg";
+
+    // Save to receipts dir so it has a public URL (same as customer images)
+    const ext = mime.includes("png") ? ".png" : mime.includes("gif") ? ".gif" : ".jpg";
+    const filename = "ADMIN-IMG-" + Date.now() + ext;
+    var receiptPath = "/docker/openclaw-sbsr/data/sentuhrasa-pdf/uploads/" + filename;
+    try { if (!fs.existsSync("/docker/openclaw-sbsr/data/sentuhrasa-pdf/uploads")) fs.mkdirSync("/docker/openclaw-sbsr/data/sentuhrasa-pdf/uploads", { recursive: true }); } catch(_) {}
+    fs.writeFileSync(receiptPath, buf);
+    var imageUrl = "https://production.biks.ai/receipts/" + filename;
+
+    // Upload to WhatsApp
+    var mediaId = await uploadMediaToWhatsApp(receiptPath, mime);
+    await sendWhatsAppImage(phone, mediaId, caption || "");
+
+    // Log with URL so admin.js can render preview
+    var logText = "[image: " + imageUrl + "]" + (caption ? " " + caption : "");
+    safeLog(admin.logOutgoing, phone, logText);
+    res.json({ ok: true, url: imageUrl });
+  } catch(e) {
+    log("admin-send-image", "Error: " + e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 try { admin.mount(app, sendWhatsAppMessage, process.env.ADMIN_PASSWORD); }
 catch (e) { log("admin", "mount failed (non-fatal): " + e.message); }
 
